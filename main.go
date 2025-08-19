@@ -1,87 +1,114 @@
 package main
 
 import "os"
-import "fmt"
 import "net"
-import "sync"
+import "time"
+import "errors"
+import "log"
 
-var sessions_mutex sync.RWMutex
+type MessageType int
+const (
+	ClientConnect MessageType = iota
+	ClientDisconnect
+	TextMessage
+)
+
+type Message struct {
+	t MessageType
+	session *Session
+	data []byte
+}
 
 type Session struct {
 	conn net.Conn
-	q chan []byte
+	write_q chan []byte
 }
 
-func do_read(sessions map[*Session]struct{}, session *Session) {
-	var buff [128]byte
+func do_read(session *Session, server_msg_q chan Message) {
 	for {
-		n , err := session.conn.Read(buff[:])
+		buff := make([]byte, 512)
+		n, err := session.conn.Read(buff)
 		if err != nil || n == 0 {
-			sessions_mutex.Lock()
-			{
-				close(session.q)
-				session.conn.Close()
-				delete(sessions, session)
-			}
-			sessions_mutex.Unlock()
-			fmt.Print("Closing do_read now!\n")
-			break;
+			server_msg_q <- Message{t: ClientDisconnect, session: session}
+			log.Print("Closing do_read now!")
+			break
 		}
 
-		sessions_mutex.RLock()
-		{
-			for k, _ := range sessions {
-				msg := make([]byte, n)
-				copy(msg, buff[:n])
-				k.q <- msg
-			}
+		server_msg_q <- Message {
+			t: TextMessage,
+			session: session,
+			data: buff[:n],
 		}
-		sessions_mutex.RUnlock()
 	}
 }
 
 func do_write(session *Session) {
 	for {
-		bytes, more := <- session.q
-		session.conn.Write(bytes)
+		bytes, more := <-session.write_q
 		if !more {
-			fmt.Print("Closing do_write now!\n")
+			break
+		}
+		session.conn.SetWriteDeadline(time.Now().Add(3*time.Second))
+		_, err := session.conn.Write(bytes)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				log.Print("Client write timed out")
+			}
 			break;
+		}
+	}
+	log.Print("Closing do_write now!")
+}
+
+func server(sessions map[*Session]struct{}, server_msg_q chan Message) {
+	for {
+		msg := <- server_msg_q
+		switch msg.t {
+		case ClientConnect: {
+			sessions[msg.session] = struct{}{}
+			go do_read(msg.session, server_msg_q)
+			go do_write(msg.session)
+			log.Print("Client Connected!")
+		}
+		case ClientDisconnect: {
+			close(msg.session.write_q)
+			msg.session.conn.Close()
+			delete(sessions, msg.session)
+			log.Print("Client Disconnected!")
+		}
+		case TextMessage: {
+			for k, _ := range sessions {
+				k.write_q <- msg.data
+			}
+		}
+		default:
 		}
 	}
 }
 
 func main() {
+	address := ":8080"
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Listening on %s", address)
 
 	sessions := make(map[*Session]struct{})
-
-	listener, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	server_msg_q := make(chan Message)
+	go server(sessions, server_msg_q)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println(err)
+			log.Print(err)
 			continue
 		}
 
 		session := &Session{
 			conn: conn,
-			q: make(chan []byte),
+			write_q: make(chan []byte),
 		}
-
-		sessions_mutex.Lock()
-		{
-			sessions[session] = struct{}{}
-		}
-		sessions_mutex.Unlock()
-
-		go do_read(sessions, session)
-		go do_write(session)
-
-		fmt.Println("Sessions len: ", len(sessions))
+		server_msg_q <- Message{t: ClientConnect, session: session}
 	}
 }
